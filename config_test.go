@@ -43,6 +43,17 @@ func TestLoadOptionsFromConfig(t *testing.T) {
 			"",
 		},
 		{
+			"ssh-forward-dir",
+			filepath.Join("testdata", "config", "ssh-forward-dir.yaml"),
+			&OpenerOptions{
+				Network:          "unix",
+				Address:          "~/.opener.sock",
+				ControlSocketDir: "~/.ssh/cm_socket",
+				ForwardTTLRaw:    "5m",
+			},
+			"",
+		},
+		{
 			"empty",
 			filepath.Join("testdata", "config", "empty.yaml"),
 			&OpenerOptions{},

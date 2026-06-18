@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -154,9 +158,9 @@ func TestShouldForward(t *testing.T) {
 
 func TestForwardTrackerCleanup(t *testing.T) {
 	tt := []struct {
-		name            string
-		cancelCmd       string // "true" (exit 0) or "false" (exit 1)
-		expiredRemoved  bool
+		name           string
+		cancelCmd      string // "true" (exit 0) or "false" (exit 1)
+		expiredRemoved bool
 	}{
 		{"cancel succeeds", "true", true},
 		{"cancel fails", "false", false},
@@ -213,6 +217,89 @@ func TestForwardTrackerForwardLogsError(t *testing.T) {
 	ft.forward("12345")
 	if !strings.Contains(buf.String(), "opener: ssh forward -L") {
 		t.Errorf("expected forward error log, got: %s", buf.String())
+	}
+}
+
+func TestDirectoryForwardTrackerForwardFansOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir) // bind on short basenames; the socket path has a length limit
+	for _, name := range []string{"host-a", "host-b"} {
+		ln, err := net.Listen("unix", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+	}
+	if err := os.WriteFile(filepath.Join(dir, "not-a-socket"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	forwarded := map[string][]string{} // socket -> "op:port"
+	d := newDirectoryForwardTracker(dir, time.Minute, io.Discard)
+	d.newTracker = func(socket string) *forwardTracker {
+		ft := newForwardTracker(socket, time.Minute, io.Discard)
+		ft.sshControlCmdFunc = func(ctx context.Context, op, port string) *exec.Cmd {
+			mu.Lock()
+			forwarded[socket] = append(forwarded[socket], op+":"+port)
+			mu.Unlock()
+			return exec.Command("true")
+		}
+		return ft
+	}
+
+	d.forward("12345")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(forwarded) != 2 {
+		t.Fatalf("expected 2 sockets forwarded, got %d: %v", len(forwarded), forwarded)
+	}
+	for _, name := range []string{"host-a", "host-b"} {
+		socket := filepath.Join(dir, name)
+		if got := forwarded[socket]; len(got) != 1 || got[0] != "forward:12345" {
+			t.Errorf("socket %s: expected [forward:12345], got %v", socket, got)
+		}
+	}
+}
+
+func TestDirectoryForwardTrackerCleanupReapsVanishedSockets(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir) // bind on a short basename; the socket path has a length limit
+	socket := filepath.Join(dir, "host-a")
+	ln, err := net.Listen("unix", "host-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDirectoryForwardTracker(dir, time.Minute, io.Discard)
+	d.newTracker = func(socket string) *forwardTracker {
+		ft := newForwardTracker(socket, time.Minute, io.Discard)
+		ft.sshControlCmdFunc = func(ctx context.Context, op, port string) *exec.Cmd {
+			return exec.Command("true")
+		}
+		return ft
+	}
+
+	d.forward("12345")
+	d.mu.Lock()
+	_, ok := d.trackers[socket]
+	d.mu.Unlock()
+	if !ok {
+		t.Fatal("expected a tracker for host-a after forward")
+	}
+
+	ln.Close() // closing a unix listener unlinks the socket file
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("expected socket to be gone after Close, stat err = %v", err)
+	}
+
+	d.cleanup()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.trackers[socket]; ok {
+		t.Error("expected tracker for vanished socket to be reaped")
 	}
 }
 

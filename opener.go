@@ -27,10 +27,11 @@ var (
 )
 
 type OpenerOptions struct {
-	Network       string `json:"network"`
-	Address       string `json:"address"`
-	ControlSocket string `json:"auto-forward-control-socket"`
-	ForwardTTLRaw string `json:"auto-forward-ttl"`
+	Network          string `json:"network"`
+	Address          string `json:"address"`
+	ControlSocket    string `json:"auto-forward-control-socket"`
+	ControlSocketDir string `json:"auto-forward-control-socket-directory"`
+	ForwardTTLRaw    string `json:"auto-forward-ttl"`
 
 	ForwardTTL time.Duration
 	ErrOut     io.Writer
@@ -90,7 +91,17 @@ func (o *OpenerOptions) Validate() error {
 			return err
 		}
 		o.ControlSocket = expanded
+	}
 
+	if o.ControlSocketDir != "" {
+		expanded, err := homedir.Expand(o.ControlSocketDir)
+		if err != nil {
+			return err
+		}
+		o.ControlSocketDir = expanded
+	}
+
+	if o.ControlSocket != "" || o.ControlSocketDir != "" {
 		if o.ForwardTTLRaw != "" {
 			d, err := time.ParseDuration(o.ForwardTTLRaw)
 			if err != nil {
@@ -117,12 +128,28 @@ func (o *OpenerOptions) Run() error {
 
 	defer ln.Close()
 
-	var ft *forwardTracker
+	var forwarders []forwarder
 	if o.ControlSocket != "" {
 		fmt.Fprintf(o.ErrOut, "Starting auto socket forwarder. auto-forward-control-socket: %q, auto-forward-ttl: %q\n", o.ControlSocket, o.ForwardTTL)
+		forwarders = append(forwarders, newForwardTracker(o.ControlSocket, o.ForwardTTL, o.ErrOut))
+	}
+	if o.ControlSocketDir != "" {
+		fmt.Fprintf(o.ErrOut, "Starting auto socket forwarder. auto-forward-control-socket-directory: %q, auto-forward-ttl: %q\n", o.ControlSocketDir, o.ForwardTTL)
+		forwarders = append(forwarders, newDirectoryForwardTracker(o.ControlSocketDir, o.ForwardTTL, o.ErrOut))
+	}
+
+	var fwd forwarder
+	switch len(forwarders) {
+	case 0:
+	case 1:
+		fwd = forwarders[0]
+	default:
+		fwd = multiForwarder(forwarders)
+	}
+
+	if fwd != nil {
 		ctx, cancel := context.WithCancel(context.Background())
-		ft = newForwardTracker(o.ControlSocket, o.ForwardTTL, o.ErrOut)
-		go ft.run(ctx)
+		go fwd.run(ctx)
 		defer cancel()
 	}
 
@@ -134,7 +161,7 @@ func (o *OpenerOptions) Run() error {
 				return
 			}
 
-			go handleConnection(conn, o.ErrOut, ft)
+			go handleConnection(conn, o.ErrOut, fwd)
 		}
 	}()
 
@@ -174,7 +201,7 @@ var openURL = func(line string) (string, error) {
 	return buf.String(), err
 }
 
-func handleConnection(conn net.Conn, errOut io.Writer, tracker *forwardTracker) {
+func handleConnection(conn net.Conn, errOut io.Writer, tracker forwarder) {
 	defer conn.Close()
 
 	line, err := bufio.NewReader(conn).ReadString('\n')

@@ -103,6 +103,11 @@ address: ~/.opener.sock
 # SSH control socket for automatic port forwarding (optional, see below).
 auto-forward-control-socket: ~/.ssh/cm_socket/my-remote
 
+# Directory of SSH control sockets for automatic port forwarding (optional, see
+# below). Every UNIX-domain socket in this directory is treated as a control
+# socket and gets the same forwards as auto-forward-control-socket.
+auto-forward-control-socket-directory: ~/.ssh/cm_socket
+
 # How long to keep a forwarded port before cleaning it up. (defaults to 1m)
 auto-forward-ttl: 60s
 ```
@@ -145,6 +150,33 @@ When opener receives a URL like
 it will run `ssh -S ~/.ssh/cm_socket/my-remote -O forward -L 54123:localhost:54123 none`
 before opening the URL in your browser. After `auto-forward-ttl` elapses the port
 forward is removed with `ssh -O cancel`.
+
+#### Forwarding to several hosts at once
+
+SSH requires a separate control socket per host, so `auto-forward-control-socket`
+only covers one connection. If you are connected to several remote hosts at the
+same time and want any of them to be able to open localhost URLs, set
+`auto-forward-control-socket-directory` to a directory that holds one control
+socket per host:
+
+```
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm_socket/%r@%h:%p
+  ControlPersist 60m
+```
+
+```yaml
+auto-forward-control-socket-directory: ~/.ssh/cm_socket
+auto-forward-ttl: 60s
+```
+
+opener rescans the directory on every URL it receives, so control sockets may
+come and go as SSH connections are established and torn down. When a localhost
+URL with a non-standard port arrives, opener sets up the forward over every
+UNIX-domain socket currently in the directory, exactly as it does for a single
+`auto-forward-control-socket`. The two settings may be used together. Forwards
+through a socket that disappears die with the SSH connection.
 
 ### Example: Open a URL from inside a container
 
