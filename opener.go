@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -201,6 +202,23 @@ var openURL = func(line string) (string, error) {
 	return buf.String(), err
 }
 
+// cPattern matches a connection identifier sent by the remote: the %C hash
+// (40 lowercase hex chars) when ControlPath uses %C, or any other
+// filesystem-safe token a user might embed in a socket path. URLs always
+// contain ":" or "/", so they can never be mistaken for an id.
+var cPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// parseMessage splits a line received from a remote into an optional
+// connection id and the URL. The format is "<id> <url>" where the id is
+// separated from the URL by the first space; a bare URL yields an empty id.
+func parseMessage(line string) (c, rawURL string) {
+	first, rest, found := strings.Cut(line, " ")
+	if found && cPattern.MatchString(first) {
+		return first, strings.TrimSpace(rest)
+	}
+	return "", line
+}
+
 func handleConnection(conn net.Conn, errOut io.Writer, tracker forwarder) {
 	defer conn.Close()
 
@@ -214,20 +232,22 @@ func handleConnection(conn net.Conn, errOut io.Writer, tracker forwarder) {
 		}
 	}
 
+	c, rawURL := parseMessage(line)
+
 	if tracker != nil {
-		if port, ok := shouldForward(line); ok {
-			tracker.forward(port)
+		if port, ok := shouldForward(rawURL); ok {
+			tracker.forward(c, port)
 		}
 	}
 
-	logs, err := openURL(line)
+	logs, err := openURL(rawURL)
 
 	if logs != "" {
 		fmt.Fprint(errOut, logs)
 	}
 
 	if err != nil {
-		fmt.Fprintf(errOut, "failed to open %q: %v\n", line, err)
+		fmt.Fprintf(errOut, "failed to open %q: %v\n", rawURL, err)
 
 		// Send back the logs from `open` to the client over e.g. the unix domain socket, so that
 		// `open` on the client machine would work more like that on the server.

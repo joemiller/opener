@@ -20,9 +20,23 @@ const cleanupInterval = 10 * time.Second
 
 // forwarder sets up SSH port forwards for loopback ports and periodically
 // cleans up expired ones until its context is cancelled.
+//
+// The c argument to forward identifies which SSH connection the request came
+// from (conventionally the %C hash used in the control socket's file name).
+// An empty c means the connection is unknown and the forward is fanned out
+// to every known control socket, which is the historical behavior.
 type forwarder interface {
-	forward(port string)
+	forward(c, port string)
 	run(ctx context.Context)
+}
+
+// socketMatchesID reports whether the control socket at socket is identified
+// by c. c matches if it equals the socket's base name, with or without
+// a ".sock" extension, so both "ControlPath ~/.ssh/control/%C" and
+// "ControlPath ~/.ssh/control/%C.sock" work with a c of the raw %C hash.
+func socketMatchesID(socket, c string) bool {
+	base := filepath.Base(socket)
+	return base == c || base == c+".sock"
 }
 
 // shouldForward parses rawURL and returns a non-standard loopback port if the URL
@@ -82,6 +96,7 @@ func loopbackPort(u *url.URL) string {
 }
 
 type forwardTracker struct {
+	socket            string
 	mu                sync.Mutex
 	active            map[string]time.Time // port -> last forwarded time
 	ttl               time.Duration
@@ -91,6 +106,7 @@ type forwardTracker struct {
 
 func newForwardTracker(controlSocket string, ttl time.Duration, errOut io.Writer) *forwardTracker {
 	return &forwardTracker{
+		socket: controlSocket,
 		active: make(map[string]time.Time),
 		ttl:    ttl,
 		errOut: errOut,
@@ -100,7 +116,15 @@ func newForwardTracker(controlSocket string, ttl time.Duration, errOut io.Writer
 	}
 }
 
-func (ft *forwardTracker) forward(port string) {
+func (ft *forwardTracker) forward(c, port string) {
+	// A request that identifies its connection must not be forwarded over a
+	// different connection's control socket.
+	if c != "" && !socketMatchesID(ft.socket, c) {
+		if ft.errOut != nil {
+			fmt.Fprintf(ft.errOut, "opener: skipping forward -L %s:localhost:%s: control socket %s does not match connection id %q\n", port, port, ft.socket, c)
+		}
+		return
+	}
 	ft.mu.Lock()
 	if _, exists := ft.active[port]; exists {
 		ft.active[port] = time.Now()
@@ -242,14 +266,36 @@ func (d *directoryForwardTracker) tracker(socket string) *forwardTracker {
 	return ft
 }
 
-func (d *directoryForwardTracker) forward(port string) {
+func (d *directoryForwardTracker) forward(c, port string) {
+	sockets := d.sockets()
+
+	// When the remote identified its connection, forward only over the
+	// matching control socket. Forwarding the same -L port over every socket
+	// does not work: the local port can only be bound once, and the winner
+	// might be the wrong host.
+	if c != "" {
+		var matched []string
+		for _, socket := range sockets {
+			if socketMatchesID(socket, c) {
+				matched = append(matched, socket)
+			}
+		}
+		if len(matched) == 0 {
+			if d.errOut != nil {
+				fmt.Fprintf(d.errOut, "opener: no control socket in %s matches connection id %q; not forwarding port %s\n", d.dir, c, port)
+			}
+			return
+		}
+		sockets = matched
+	}
+
 	var wg sync.WaitGroup
-	for _, socket := range d.sockets() {
+	for _, socket := range sockets {
 		ft := d.tracker(socket)
 		wg.Add(1)
 		go func(ft *forwardTracker) {
 			defer wg.Done()
-			ft.forward(port)
+			ft.forward("", port) // sockets are already matched on c
 		}(ft)
 	}
 	wg.Wait()
@@ -296,13 +342,13 @@ func (d *directoryForwardTracker) run(ctx context.Context) {
 // multiForwarder fans out forward and run calls to several forwarders.
 type multiForwarder []forwarder
 
-func (m multiForwarder) forward(port string) {
+func (m multiForwarder) forward(c, port string) {
 	var wg sync.WaitGroup
 	for _, f := range m {
 		wg.Add(1)
 		go func(f forwarder) {
 			defer wg.Done()
-			f.forward(port)
+			f.forward(c, port)
 		}(f)
 	}
 	wg.Wait()

@@ -172,11 +172,56 @@ auto-forward-ttl: 60s
 ```
 
 opener rescans the directory on every URL it receives, so control sockets may
-come and go as SSH connections are established and torn down. When a localhost
-URL with a non-standard port arrives, opener sets up the forward over every
-UNIX-domain socket currently in the directory, exactly as it does for a single
-`auto-forward-control-socket`. The two settings may be used together. Forwards
-through a socket that disappears die with the SSH connection.
+come and go as SSH connections are established and torn down. The two settings
+may be used together. Forwards through a socket that disappears die with the
+SSH connection.
+
+#### Telling connections apart with %C
+
+A `-L` port can only be bound once on your local machine, so when several
+connections share the control socket directory, opener needs to know *which*
+connection a URL came from. Otherwise the forward is attempted over every
+socket and only one (arbitrary) connection wins the local port — the rest fail
+with "Port forwarding failed", and the winner may be the wrong host.
+
+To fix this, use the `%C` connection hash as the control socket file name and
+inject it into the remote environment with `SetEnv`:
+
+```
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm_socket/%C.sock
+  ControlPersist 60m
+  SetEnv OPENER_SOCKET_C=%C
+```
+
+The remote sshd must accept the variable (this requires administrator access):
+
+```sh
+# Add a configuration file
+$ echo "AcceptEnv OPENER_SOCKET_C" | sudo tee /etc/ssh/sshd_config.d/opener.conf
+# Restart ssh service
+$ sudo systemctl restart ssh
+```
+
+The bundled fake `open`/`xdg-open` scripts send `$OPENER_SOCKET_C` to opener
+as a prefix to the URL: `<id> <url>`. opener then sets up the port forward
+only over the control socket whose file name matches the id, so the forward
+always goes to the host the URL came from.
+
+Notes:
+
+- `%`-expansion in `SetEnv` requires a recent OpenSSH client. On older clients
+the literal string `%C` is sent; the fake scripts detect this and fall back to
+sending no id.
+- If you cannot change `AcceptEnv` on the remote sshd, embed the hash in the
+forwarded socket path instead — `RemoteForward ~/.opener-%C.sock
+~/.opener.sock` — and the fake scripts will derive the id from the socket file
+name (`~/.opener-<id>.sock`). This needs no sshd changes.
+- You can override the id with the `OPENER_SOCKET_C` environment variable and
+the socket path with `OPENER_SOCK`.
+- Messages without an id prefix (older fake scripts) keep the historical
+behavior: the forward is fanned out to every socket in the directory.
 
 ### Example: Open a URL from inside a container
 

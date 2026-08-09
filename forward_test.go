@@ -214,7 +214,7 @@ func TestForwardTrackerRunExitsOnContextCancel(t *testing.T) {
 func TestForwardTrackerForwardLogsError(t *testing.T) {
 	var buf bytes.Buffer
 	ft := newForwardTracker("/nonexistent/control/socket", time.Minute, &buf)
-	ft.forward("12345")
+	ft.forward("", "12345")
 	if !strings.Contains(buf.String(), "opener: ssh forward -L") {
 		t.Errorf("expected forward error log, got: %s", buf.String())
 	}
@@ -248,7 +248,7 @@ func TestDirectoryForwardTrackerForwardFansOut(t *testing.T) {
 		return ft
 	}
 
-	d.forward("12345")
+	d.forward("", "12345")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -281,7 +281,7 @@ func TestDirectoryForwardTrackerCleanupReapsVanishedSockets(t *testing.T) {
 		return ft
 	}
 
-	d.forward("12345")
+	d.forward("", "12345")
 	d.mu.Lock()
 	_, ok := d.trackers[socket]
 	d.mu.Unlock()
@@ -311,8 +311,8 @@ func TestForwardTrackerForwardDedup(t *testing.T) {
 		return exec.Command("true")
 	}
 
-	ft.forward("12345")
-	ft.forward("12345")
+	ft.forward("", "12345")
+	ft.forward("", "12345")
 
 	if n := calls.Load(); n != 1 {
 		t.Errorf("expected ssh to be called once, got %d", n)
@@ -321,5 +321,131 @@ func TestForwardTrackerForwardDedup(t *testing.T) {
 	defer ft.mu.Unlock()
 	if _, ok := ft.active["12345"]; !ok {
 		t.Error("port should remain in active map")
+	}
+}
+
+func TestParseMessage(t *testing.T) {
+	tt := []struct {
+		name    string
+		line    string
+		wantID  string
+		wantURL string
+	}{
+		{"bare URL", "http://localhost:12345/cb", "", "http://localhost:12345/cb"},
+		{"%C hash prefix", "656ce8589523b0fcef8cf0dd077da245d153de5b http://localhost:12345/cb", "656ce8589523b0fcef8cf0dd077da245d153de5b", "http://localhost:12345/cb"},
+		{"hostname-style id", "my-host.example.org https://example.com/?redirect_uri=http%3A%2F%2Flocalhost%3A38947", "my-host.example.org", "https://example.com/?redirect_uri=http%3A%2F%2Flocalhost%3A38947"},
+		{"id with extra spaces", "abc123  http://localhost:8085/", "abc123", "http://localhost:8085/"},
+		{"URL with query ampersands no space", "https://example.com/?a=1&b=2", "", "https://example.com/?a=1&b=2"},
+		{"space but first token is URL", "http://localhost:1 has space", "", "http://localhost:1 has space"},
+		{"path traversal rejected as id", "../evil http://localhost:1", "", "../evil http://localhost:1"},
+		{"empty", "", "", ""},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			c, rawURL := parseMessage(tc.line)
+			if c != tc.wantID || rawURL != tc.wantURL {
+				t.Errorf("parseMessage(%q) = %q, %q; want %q, %q", tc.line, c, rawURL, tc.wantID, tc.wantURL)
+			}
+		})
+	}
+}
+
+func TestSocketMatchesID(t *testing.T) {
+	tt := []struct {
+		socket string
+		c      string
+		want   bool
+	}{
+		{"/home/me/.ssh/control/abc123", "abc123", true},
+		{"/home/me/.ssh/control/abc123.sock", "abc123", true},
+		{"/home/me/.ssh/control/abc123.sock", "abc123.sock", true},
+		{"/home/me/.ssh/control/abc123", "def456", false},
+		{"/home/me/.ssh/control/abc12345", "abc123", false},
+		{"/home/me/.ssh/control/me@host:22", "me@host:22", true},
+	}
+	for _, tc := range tt {
+		if got := socketMatchesID(tc.socket, tc.c); got != tc.want {
+			t.Errorf("socketMatchesID(%q, %q) = %v; want %v", tc.socket, tc.c, got, tc.want)
+		}
+	}
+}
+
+func TestForwardTrackerForwardSkipsMismatchedID(t *testing.T) {
+	var calls atomic.Int32
+	ft := newForwardTracker("/control/host-a", time.Minute, io.Discard)
+	ft.sshControlCmdFunc = func(ctx context.Context, op, port string) *exec.Cmd {
+		calls.Add(1)
+		return exec.Command("true")
+	}
+
+	ft.forward("host-b", "12345") // mismatched id: must not exec ssh
+	if n := calls.Load(); n != 0 {
+		t.Errorf("expected ssh not to be called for mismatched id, got %d calls", n)
+	}
+	ft.mu.Lock()
+	_, ok := ft.active["12345"]
+	ft.mu.Unlock()
+	if ok {
+		t.Error("port should not be marked active for mismatched id")
+	}
+
+	ft.forward("host-a", "12345") // matching id
+	if n := calls.Load(); n != 1 {
+		t.Errorf("expected ssh to be called once for matching id, got %d", n)
+	}
+}
+
+func TestDirectoryForwardTrackerForwardTargetsMatchingSocket(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir) // bind on short basenames; the socket path has a length limit
+	for _, name := range []string{"hash-a.sock", "hash-b.sock"} {
+		ln, err := net.Listen("unix", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+	}
+
+	var mu sync.Mutex
+	forwarded := map[string][]string{} // socket -> ports
+	d := newDirectoryForwardTracker(dir, time.Minute, io.Discard)
+	d.newTracker = func(socket string) *forwardTracker {
+		ft := newForwardTracker(socket, time.Minute, io.Discard)
+		ft.sshControlCmdFunc = func(ctx context.Context, op, port string) *exec.Cmd {
+			mu.Lock()
+			forwarded[socket] = append(forwarded[socket], port)
+			mu.Unlock()
+			return exec.Command("true")
+		}
+		return ft
+	}
+
+	// Targeted forward: only the matching socket gets the port.
+	d.forward("hash-a", "12345")
+
+	mu.Lock()
+	if got := forwarded[filepath.Join(dir, "hash-a.sock")]; len(got) != 1 || got[0] != "12345" {
+		t.Errorf("expected hash-a.sock to forward 12345, got %v", got)
+	}
+	if got := forwarded[filepath.Join(dir, "hash-b.sock")]; len(got) != 0 {
+		t.Errorf("expected hash-b.sock to forward nothing, got %v", got)
+	}
+	mu.Unlock()
+
+	// Unknown id: nothing is forwarded.
+	var buf bytes.Buffer
+	d.errOut = &buf
+	d.forward("hash-c", "22222")
+	mu.Lock()
+	for socket, got := range forwarded {
+		for _, p := range got {
+			if p == "22222" {
+				t.Errorf("socket %s unexpectedly forwarded unknown-id port 22222", socket)
+			}
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(buf.String(), "no control socket") {
+		t.Errorf("expected a 'no control socket' log, got: %s", buf.String())
 	}
 }
